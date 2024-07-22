@@ -71,6 +71,104 @@ export class SSHSession extends Session {
         return;
       }
 
+      // Preferred order for authentication controlled via authHandler
+      //  https://github.com/mscdex/ssh2/issues/1400
+      // Attempt all noninteractive methods first, then do interactive ones
+      // This array will go into a closure and be modified
+      // We do not include methods that we cannot support in code below. eg:
+      //  hostbased - don't have easy access to relevant keys, here
+      //  gssapi* - not supported by ssh library
+      const authMethodOrder: string[] = [
+        "agent",
+        "publickey",
+        "password",
+        "keyboard-interactive",
+      ];
+      const _cfg = this._config;
+
+      function myAuthHandler(methodsLeft, partialSuccess, cb) {
+        console.log(methodsLeft);
+        if (methodsLeft === null) {
+          cb({
+            type: "none",
+            username: _cfg.username,
+          });
+        } else {
+          while (authMethodOrder.length) {
+            const nextCheckMethod = authMethodOrder.shift();
+            console.log("Trying method: " + nextCheckMethod);
+            if (methodsLeft.includes(nextCheckMethod)) {
+              switch (nextCheckMethod) {
+                case "password":
+                  createInputTextBox(
+                    ProfilePromptType.SSHPassword,
+                    "",
+                    true,
+                  ).then((password) => {
+                    cb({
+                      type: "password",
+                      username: _cfg.username,
+                      password: password,
+                    });
+                    return;
+                  });
+                  break;
+                case "agent":
+                  cb({
+                    type: "agent",
+                    username: _cfg.username,
+                    agent: process.env.SSH_AUTH_SOCK || undefined,
+                  });
+                  return;
+                case "publickey":
+                  if (process.env.SSH_AUTH_SOCK !== undefined) {
+                    cb({
+                      type: "agent",
+                      username: _cfg.username,
+                      agent: process.env.SSH_AUTH_SOCK,
+                    });
+                  }
+                  // This code commented out because this._config.identityFile not provided for in this patch
+                  /* else if (_cfg.identityFile !== undefined) {
+                    cb({
+                      type: "publickey",
+                      username: _cfg.username,
+                      key: readFileSync(_cfg.identityFile),
+                    });
+                  } */
+                  return;
+                case "keyboard-interactive":
+                  cb({
+                    type: "keyboard-interactive",
+                    username: _cfg.username,
+                    prompt: (name, instructions, lang, prompts, finish) => {
+                      if (
+                        prompts.length === 1 &&
+                        prompts[0].prompt.toLowerCase().includes("password")
+                      ) {
+                        createInputTextBox(
+                          ProfilePromptType.SSHPassword,
+                          "",
+                          true,
+                        ).then((password) => {
+                          finish([password]);
+                        });
+                      } else {
+                        finish([]);
+                      }
+                    },
+                  });
+                  return;
+                default:
+                  console.log(
+                    "Don't know what to do with auth method " + nextCheckMethod,
+                  );
+              }
+            }
+          }
+        }
+      }
+
       const cfg: ConnectConfig = {
         host: this._config.host,
         port: this._config.port,
@@ -79,26 +177,8 @@ export class SSHSession extends Session {
         agent: process.env.SSH_AUTH_SOCK || undefined,
         tryKeyboard: true, // Let library know that passwords are on offer
         password: "", // Setting this to not-undefined, "password" is added to the list of authsAllowed in the client
+        authHandler: myAuthHandler,
       };
-
-      // If the server explicitly requests keyboard-interactive password, prompt user for password
-      this.conn.on(
-        "keyboard-interactive",
-        (name, instructions, lang, prompts, finish) => {
-          if (
-            prompts.length === 1 &&
-            prompts[0].prompt.toLowerCase().includes("password")
-          ) {
-            createInputTextBox(ProfilePromptType.SSHPassword, "", true).then(
-              (password) => {
-                finish([password]);
-              },
-            );
-          } else {
-            finish([]);
-          }
-        },
-      );
 
       // If all other authentication methods fail, re-try the connection after prompting user for a password
       this.conn.on("error", (err) => {
